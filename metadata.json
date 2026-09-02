@@ -1,0 +1,6 @@
+{
+  "name": "MONADIRE",
+  "description": "ქართული სანადირო აპლიკაცია - რუკა, GPS, ნადირობის დღიური, ამინდი, სახეობები და აღჭურვილობა",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
