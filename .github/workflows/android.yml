@@ -27,41 +27,40 @@ jobs:
           java-version: '17'
           cache: 'gradle'
 
-      - name: Prepare environment and keystore
+      - name: Setup environment and keystore
         run: |
-          # Create .env from .env.example if not present
+          # Create .env if not present
           if [ -f ".env.example" ] && [ ! -f ".env" ]; then
             cp .env.example .env
           elif [ ! -f ".env" ]; then
             touch .env
           fi
 
-          # Decode debug keystore if base64 file exists
-          if [ -f "debug.keystore.base64" ] && [ ! -f "debug.keystore" ]; then
+          # Setup debug keystore for assembleDebug
+          if [ -f "debug.keystore.base64" ]; then
             base64 -d debug.keystore.base64 > debug.keystore
+          elif [ ! -f "debug.keystore" ]; then
+            keytool -genkey -v -keystore debug.keystore -storepass android -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
           fi
 
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
 
-      - name: Grant execute permission for gradlew (if present)
+      - name: Grant execute permission for gradlew
         run: |
-          if [ -f "./gradlew" ]; then
-            chmod +x ./gradlew
+          if [ ! -f "gradlew" ]; then
+            gradle wrapper
           fi
+          chmod +x gradlew
 
       - name: Build Debug APK
-        run: |
-          if [ -f "./gradlew" ]; then
-            ./gradlew assembleDebug --stacktrace
-          else
-            gradle assembleDebug --stacktrace
-          fi
+        run: ./gradlew assembleDebug --stacktrace
 
-      - name: Upload Debug APK Artifact
+      - name: Upload Debug APK
         uses: actions/upload-artifact@v4
         with:
-          name: Monadire-Debug-APK
-          path: app/build/outputs/apk/debug/*.apk
+          name: app-debug
+          path: app/build/outputs/apk/debug/app-debug.apk
           retention-days: 14
           if-no-files-found: error
+
