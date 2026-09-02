@@ -4,8 +4,11 @@ import android.Manifest
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.location.Location
+import android.location.LocationListener
 import android.location.LocationManager
 import android.net.Uri
+import android.os.Bundle
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -41,17 +44,33 @@ import androidx.compose.ui.graphics.PathEffect
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
+import coil.ImageLoader
+import coil.compose.AsyncImage
+import coil.request.ImageRequest
 import com.example.data.model.HuntingSpotEntity
+import com.example.ui.components.HuntingWeatherBottomSheet
+import com.example.ui.components.MapWeatherFloatingBadge
 import com.example.ui.theme.*
 import com.example.viewmodel.MonadireViewModel
+import okhttp3.OkHttpClient
 import kotlin.math.*
+
+enum class MapLayerType(val title: String, val subtitle: String, val icon: ImageVector) {
+    SATELLITE("სატელიტი", "ArcGIS World Imagery", Icons.Default.SatelliteAlt),
+    OPENSTREETMAP("OpenStreetMap", "დეტალური ქუჩები & ბუნება", Icons.Default.Map),
+    OPENTOPOMAP("OpenTopoMap", "ტოპოგრაფიული რელიეფი", Icons.Default.Terrain),
+    TACTICAL_DARK("ტაქტიკური ბნელი", "CartoDB Dark Matter", Icons.Default.DarkMode)
+}
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -60,8 +79,11 @@ fun MapScreen(
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
+    val density = LocalDensity.current
     val allSpots by viewModel.allSpots.collectAsState()
     val selectedCategory by viewModel.selectedSpotCategory.collectAsState()
+    val detailedWeather by viewModel.detailedWeather.collectAsState()
+    val isWeatherLoading by viewModel.isWeatherLoading.collectAsState()
 
     var selectedSpot by remember { mutableStateOf<HuntingSpotEntity?>(null) }
     var editingSpot by remember { mutableStateOf<HuntingSpotEntity?>(null) }
@@ -69,18 +91,23 @@ fun MapScreen(
 
     var showAddSpotDialog by remember { mutableStateOf(false) }
     var showSpotsListSheet by remember { mutableStateOf(false) }
+    var showLayerSelectionSheet by remember { mutableStateOf(false) }
     var showPrivacyInfoDialog by remember { mutableStateOf(false) }
+    var showWeatherSheet by remember { mutableStateOf(false) }
 
-    // Map Transformations
-    var mapZoom by remember { mutableFloatStateOf(1.0f) }
+    // Selected Map Tile Layer (Default: Satellite for true hunting outdoor awareness)
+    var selectedMapLayer by remember { mutableStateOf(MapLayerType.SATELLITE) }
+
+    // Map Transformations (Pan Offset & Zoom Level)
+    var mapZoom by remember { mutableFloatStateOf(13.5f) }
     var mapOffset by remember { mutableStateOf(Offset.Zero) }
 
-    // Hunter GPS Position (Defaults to Georgia Hunting Grounds - Sagarejo / Borjomi)
+    // Hunter GPS Position (Defaults to Georgia Sagarejo / Gardabani hunting fields)
     var hunterLat by remember { mutableDoubleStateOf(41.7335) }
     var hunterLng by remember { mutableDoubleStateOf(45.3312) }
     var hunterElevation by remember { mutableIntStateOf(720) }
     var isGpsActive by remember { mutableStateOf(false) }
-    var gpsAccuracyMeters by remember { mutableFloatStateOf(8.5f) }
+    var gpsAccuracyMeters by remember { mutableFloatStateOf(6.0f) }
 
     // Map Tap Location (for placing custom pins by tapping)
     var tappedMapCoordinate by remember { mutableStateOf<Pair<Double, Double>?>(null) }
@@ -95,37 +122,52 @@ fun MapScreen(
     // Search query for spots
     var searchQuery by remember { mutableStateOf("") }
 
-    // GPS Location Permission & Tracking Setup
-    val locationPermissionLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.RequestMultiplePermissions()
-    ) { permissions ->
-        val granted = permissions[Manifest.permission.ACCESS_FINE_LOCATION] == true ||
-                permissions[Manifest.permission.ACCESS_COARSE_LOCATION] == true
-        if (granted) {
-            isGpsActive = true
-            try {
-                val locationManager = context.getSystemService(Context.LOCATION_SERVICE) as? LocationManager
-                val lastKnown = locationManager?.getLastKnownLocation(LocationManager.GPS_PROVIDER)
-                    ?: locationManager?.getLastKnownLocation(LocationManager.NETWORK_PROVIDER)
-                if (lastKnown != null) {
-                    hunterLat = lastKnown.latitude
-                    hunterLng = lastKnown.longitude
-                    hunterElevation = lastKnown.altitude.toInt().coerceAtLeast(300)
-                    gpsAccuracyMeters = lastKnown.accuracy
-                }
-                Toast.makeText(context, "GPS ლოკაცია წარმატებით ჩაირთო", Toast.LENGTH_SHORT).show()
-            } catch (e: SecurityException) {
-                // Ignore
+    // Dedicated OkHttpClient with explicit User-Agent compliant with OpenStreetMap and tile server policies
+    val tileImageLoader = remember {
+        val okHttpClient = OkHttpClient.Builder()
+            .addInterceptor { chain ->
+                val request = chain.request().newBuilder()
+                    .header("User-Agent", "MonadireApp/1.0 (Android; Georgian Hunter GIS; contact: dls.service@yahoo.com)")
+                    .header("Accept", "image/webp,image/png,image/jpeg,image/*;q=0.8")
+                    .build()
+                chain.proceed(request)
             }
-        } else {
-            Toast.makeText(context, "GPS ნებართვა არ არის მინიჭებული. გამოყენებულია სტანდარტული კოორდინატები", Toast.LENGTH_LONG).show()
+            .build()
+
+        ImageLoader.Builder(context)
+            .okHttpClient(okHttpClient)
+            .crossfade(true)
+            .build()
+    }
+
+    // Live GPS Location Manager & Listener
+    val locationListener = remember {
+        object : LocationListener {
+            override fun onLocationChanged(location: Location) {
+                hunterLat = location.latitude
+                hunterLng = location.longitude
+                if (location.hasAltitude()) {
+                    hunterElevation = location.altitude.toInt()
+                }
+                if (location.hasAccuracy()) {
+                    gpsAccuracyMeters = location.accuracy
+                }
+                isGpsActive = true
+            }
+
+            @Deprecated("Deprecated in Java")
+            override fun onStatusChanged(provider: String?, status: Int, extras: Bundle?) {}
+            override fun onProviderEnabled(provider: String) { isGpsActive = true }
+            override fun onProviderDisabled(provider: String) {}
         }
     }
 
-    // Check GPS Permission on first composition
-    LaunchedEffect(Unit) {
-        val fineGranted = ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
-        val coarseGranted = ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
+    // Location Permission Launcher
+    val locationPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestMultiplePermissions()
+    ) { permissions ->
+        val fineGranted = permissions[Manifest.permission.ACCESS_FINE_LOCATION] == true
+        val coarseGranted = permissions[Manifest.permission.ACCESS_COARSE_LOCATION] == true
         if (fineGranted || coarseGranted) {
             isGpsActive = true
             try {
@@ -138,10 +180,61 @@ fun MapScreen(
                     hunterElevation = lastKnown.altitude.toInt().coerceAtLeast(300)
                     gpsAccuracyMeters = lastKnown.accuracy
                 }
+                locationManager?.requestLocationUpdates(
+                    LocationManager.GPS_PROVIDER,
+                    2000L,
+                    3f,
+                    locationListener
+                )
+                Toast.makeText(context, "GPS ლოკაცია წარმატებით ჩაირთო", Toast.LENGTH_SHORT).show()
+            } catch (e: SecurityException) {
+                // Ignore
+            }
+        } else {
+            Toast.makeText(context, "GPS ნებართვა არ არის მინიჭებული. რუკა გახსნილია სტანდარტულ კოორდინატებზე", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    // Auto-request location updates if permission already granted
+    DisposableEffect(Unit) {
+        val fineGranted = ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
+        val coarseGranted = ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
+        val locationManager = context.getSystemService(Context.LOCATION_SERVICE) as? LocationManager
+
+        if (fineGranted || coarseGranted) {
+            isGpsActive = true
+            try {
+                val lastKnown = locationManager?.getLastKnownLocation(LocationManager.GPS_PROVIDER)
+                    ?: locationManager?.getLastKnownLocation(LocationManager.NETWORK_PROVIDER)
+                if (lastKnown != null) {
+                    hunterLat = lastKnown.latitude
+                    hunterLng = lastKnown.longitude
+                    hunterElevation = lastKnown.altitude.toInt().coerceAtLeast(300)
+                    gpsAccuracyMeters = lastKnown.accuracy
+                }
+                locationManager?.requestLocationUpdates(
+                    LocationManager.GPS_PROVIDER,
+                    2000L,
+                    3f,
+                    locationListener
+                )
             } catch (e: SecurityException) {
                 // Ignore
             }
         }
+
+        onDispose {
+            try {
+                locationManager?.removeUpdates(locationListener)
+            } catch (e: Exception) {
+                // Ignore
+            }
+        }
+    }
+
+    // Automatically fetch weather for initial or updated GPS coordinates
+    LaunchedEffect(hunterLat, hunterLng) {
+        viewModel.fetchWeatherForCoordinates(hunterLat, hunterLng, sourceLabel = "GPS ლოკაცია")
     }
 
     val categories = listOf("ყველა", "სანადირო ადგილი", "წყარო", "პარკინგი", "საფრთხე", "კარავი", "ტყე", "გზა", "რჩეულები")
@@ -168,8 +261,10 @@ fun MapScreen(
             .fillMaxSize()
             .background(ForestBlack)
     ) {
-        // Interactive Topographic Tactical Map Canvas
-        TacticalInteractiveMapCanvas(
+        // Tile Mapping Engine with Seamless Mercator Projection & Tactical Overlays
+        TileMercatorMap(
+            layerType = selectedMapLayer,
+            tileImageLoader = tileImageLoader,
             spots = filteredSpots,
             selectedSpot = selectedSpot,
             navigatingSpot = navigatingToSpot,
@@ -179,9 +274,9 @@ fun MapScreen(
             mapOffset = mapOffset,
             isMeasurementMode = isMeasurementMode,
             measurementPoints = measurementPoints,
-            onTransform = { pan, zoom ->
+            onTransform = { pan, zoomFactor ->
                 mapOffset += pan
-                mapZoom = (mapZoom * zoom).coerceIn(0.4f, 4.0f)
+                mapZoom = (mapZoom + (zoomFactor - 1.0f) * 2.0f).coerceIn(9.0f, 18.0f)
             },
             onSpotClicked = { spot ->
                 selectedSpot = spot
@@ -234,9 +329,9 @@ fun MapScreen(
                     ) {
                         Box(
                             modifier = Modifier
-                                .size(24.dp)
+                                .size(26.dp)
                                 .clip(CircleShape)
-                                .background(if (isGpsActive) HuntingGreenPrimary.copy(alpha = 0.2f) else WarningOrange.copy(alpha = 0.2f)),
+                                .background(if (isGpsActive) HuntingGreenPrimary.copy(alpha = 0.25f) else WarningOrange.copy(alpha = 0.2f)),
                             contentAlignment = Alignment.Center
                         ) {
                             Icon(
@@ -266,6 +361,33 @@ fun MapScreen(
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(4.dp)
                     ) {
+                        // Weather & Wind Forecast Quick Button
+                        IconButton(
+                            onClick = { showWeatherSheet = true },
+                            modifier = Modifier.size(34.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.CloudQueue,
+                                contentDescription = "ამინდი და ქარი",
+                                tint = AccentGold,
+                                modifier = Modifier.size(20.dp)
+                            )
+                        }
+
+                        // Map Layer Selector Button
+                        IconButton(
+                            onClick = { showLayerSelectionSheet = true },
+                            modifier = Modifier.size(34.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Layers,
+                                contentDescription = "რუკის ფენები",
+                                tint = TextPrimary,
+                                modifier = Modifier.size(20.dp)
+                            )
+                        }
+
+                        // Spots List Button
                         IconButton(
                             onClick = { showSpotsListSheet = true },
                             modifier = Modifier.size(34.dp)
@@ -273,11 +395,12 @@ fun MapScreen(
                             Icon(
                                 imageVector = Icons.AutoMirrored.Filled.List,
                                 contentDescription = "წერტილების სია",
-                                tint = AccentGold,
+                                tint = TextPrimary,
                                 modifier = Modifier.size(20.dp)
                             )
                         }
 
+                        // Local Privacy Dialog Button
                         IconButton(
                             onClick = { showPrivacyInfoDialog = true },
                             modifier = Modifier.size(34.dp)
@@ -294,6 +417,16 @@ fun MapScreen(
             }
 
             Spacer(modifier = Modifier.height(6.dp))
+
+            // Weather & Wind Floating HUD Badge
+            MapWeatherFloatingBadge(
+                weather = detailedWeather,
+                isLoading = isWeatherLoading,
+                onClick = { showWeatherSheet = true },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(bottom = 6.dp)
+            )
 
             // Category Filter Chips Row
             LazyRow(
@@ -335,7 +468,7 @@ fun MapScreen(
                 enter = fadeIn() + expandVertically(),
                 exit = fadeOut() + shrinkVertically()
             ) {
-                val totalDistKm = remember(measurementPoints) {
+                val totalDistKm = remember(measurementPoints, hunterLat, hunterLng) {
                     var dist = 0.0
                     if (measurementPoints.size >= 2) {
                         for (i in 0 until measurementPoints.size - 1) {
@@ -448,49 +581,32 @@ fun MapScreen(
 
                                 Column {
                                     Text(
-                                        text = "მიმართულება: ${target.name}",
+                                        text = "გეზი: ${target.name}",
                                         color = TextPrimary,
                                         fontWeight = FontWeight.Bold,
-                                        fontSize = 13.sp,
-                                        maxLines = 1,
-                                        overflow = TextOverflow.Ellipsis
+                                        fontSize = 13.sp
                                     )
                                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                                         Text(
-                                            text = if (distanceKm < 1.0) "${(distanceKm * 1000).toInt()} მ" else String.format(java.util.Locale.US, "%.2f კმ", distanceKm),
-                                            color = AccentGold,
-                                            fontWeight = FontWeight.Bold,
-                                            fontSize = 11.5.sp
-                                        )
-                                        Text(
-                                            text = "აზიმუტი $bearing°",
+                                            text = if (distanceKm < 1.0) "${(distanceKm * 1000).toInt()}მ დარჩენილია" else String.format(java.util.Locale.US, "%.2f კმ დარჩენილია", distanceKm),
                                             color = HuntingGreenLight,
-                                            fontSize = 11.sp
+                                            fontSize = 11.sp,
+                                            fontWeight = FontWeight.SemiBold
                                         )
                                         Text(
-                                            text = if (elevDiff >= 0) "+${elevDiff}მ" else "${elevDiff}მ",
-                                            color = TextSecondary,
+                                            text = "• აზიმუტი: $bearing°",
+                                            color = AccentGold,
                                             fontSize = 11.sp
                                         )
                                     }
                                 }
                             }
 
-                            Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                                IconButton(
-                                    onClick = {
-                                        openExternalMapNavigation(context, target.latitude, target.longitude, target.name)
-                                    },
-                                    modifier = Modifier.size(36.dp)
-                                ) {
-                                    Icon(Icons.Default.OpenInNew, contentDescription = "რუკა", tint = AccentGold, modifier = Modifier.size(20.dp))
-                                }
-                                IconButton(
-                                    onClick = { navigatingToSpot = null },
-                                    modifier = Modifier.size(36.dp)
-                                ) {
-                                    Icon(Icons.Default.Close, contentDescription = "შეწყვეტა", tint = AlertRed, modifier = Modifier.size(20.dp))
-                                }
+                            IconButton(
+                                onClick = { navigatingToSpot = null },
+                                modifier = Modifier.size(32.dp)
+                            ) {
+                                Icon(Icons.Default.Close, contentDescription = "შეწყვეტა", tint = TextSecondary)
                             }
                         }
                     }
@@ -498,88 +614,144 @@ fun MapScreen(
             }
         }
 
-        // Floating Action Buttons on Right Side
+        // Floating Map Controls (Recenter GPS, Zoom +/- Controls, Distance Measuring Tool, Add Pin)
         Column(
             modifier = Modifier
                 .align(Alignment.CenterEnd)
-                .padding(end = 14.dp),
-            verticalArrangement = Arrangement.spacedBy(8.dp)
+                .padding(end = 14.dp)
+                .navigationBarsPadding(),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
         ) {
-            // Zoom In
-            FloatingActionButton(
-                onClick = { mapZoom = (mapZoom * 1.3f).coerceAtMost(4.0f) },
-                containerColor = ForestDark.copy(alpha = 0.92f),
-                contentColor = TextPrimary,
-                modifier = Modifier.size(42.dp).testTag("map_zoom_in")
-            ) {
-                Icon(Icons.Default.Add, contentDescription = "გადიდება", modifier = Modifier.size(20.dp))
-            }
-
-            // Zoom Out
-            FloatingActionButton(
-                onClick = { mapZoom = (mapZoom / 1.3f).coerceAtLeast(0.4f) },
-                containerColor = ForestDark.copy(alpha = 0.92f),
-                contentColor = TextPrimary,
-                modifier = Modifier.size(42.dp).testTag("map_zoom_out")
-            ) {
-                Icon(Icons.Default.Remove, contentDescription = "დაპატარავება", modifier = Modifier.size(20.dp))
-            }
-
-            // Re-center on Hunter GPS
-            FloatingActionButton(
-                onClick = {
-                    mapOffset = Offset.Zero
-                    mapZoom = 1.0f
-                    Toast.makeText(context, "რუკა ორიენტირებულია თქვენს GPS პოზიციაზე", Toast.LENGTH_SHORT).show()
-                },
-                containerColor = ForestDark.copy(alpha = 0.92f),
+            // Layer Switch Quick Indicator
+            SmallFloatingActionButton(
+                onClick = { showLayerSelectionSheet = true },
+                containerColor = ForestDark.copy(alpha = 0.95f),
                 contentColor = AccentGold,
-                modifier = Modifier.size(42.dp).testTag("map_center")
+                shape = RoundedCornerShape(10.dp),
+                modifier = Modifier.size(42.dp)
             ) {
-                Icon(Icons.Default.MyLocation, contentDescription = "ჩემი პოზიცია", modifier = Modifier.size(20.dp))
+                Icon(selectedMapLayer.icon, contentDescription = "ფენები", modifier = Modifier.size(20.dp))
             }
 
-            // Toggle Distance Measurement Tool
-            FloatingActionButton(
+            // Recenter onto Hunter GPS Location
+            SmallFloatingActionButton(
+                onClick = {
+                    if (!isGpsActive) {
+                        locationPermissionLauncher.launch(
+                            arrayOf(
+                                Manifest.permission.ACCESS_FINE_LOCATION,
+                                Manifest.permission.ACCESS_COARSE_LOCATION
+                            )
+                        )
+                    }
+                    mapOffset = Offset.Zero
+                    mapZoom = 14.0f
+                    Toast.makeText(context, "რუკა ორიენტირებულია GPS ლოკაციაზე", Toast.LENGTH_SHORT).show()
+                },
+                containerColor = if (isGpsActive) HuntingGreenPrimary else ForestDark.copy(alpha = 0.95f),
+                contentColor = if (isGpsActive) ForestBlack else AccentGold,
+                shape = RoundedCornerShape(10.dp),
+                modifier = Modifier.size(42.dp)
+            ) {
+                Icon(Icons.Default.MyLocation, contentDescription = "ჩემი ლოკაცია", modifier = Modifier.size(20.dp))
+            }
+
+            // Zoom In (+)
+            SmallFloatingActionButton(
+                onClick = {
+                    mapZoom = (mapZoom + 1.0f).coerceAtMost(18.0f)
+                },
+                containerColor = ForestDark.copy(alpha = 0.95f),
+                contentColor = TextPrimary,
+                shape = RoundedCornerShape(10.dp),
+                modifier = Modifier.size(42.dp)
+            ) {
+                Icon(Icons.Default.Add, contentDescription = "მოახლოება", modifier = Modifier.size(20.dp))
+            }
+
+            // Zoom Out (-)
+            SmallFloatingActionButton(
+                onClick = {
+                    mapZoom = (mapZoom - 1.0f).coerceAtLeast(9.0f)
+                },
+                containerColor = ForestDark.copy(alpha = 0.95f),
+                contentColor = TextPrimary,
+                shape = RoundedCornerShape(10.dp),
+                modifier = Modifier.size(42.dp)
+            ) {
+                Icon(Icons.Default.Remove, contentDescription = "დაშორება", modifier = Modifier.size(20.dp))
+            }
+
+            // Distance Measurement Tool Toggle
+            SmallFloatingActionButton(
                 onClick = {
                     isMeasurementMode = !isMeasurementMode
-                    if (isMeasurementMode) {
+                    if (!isMeasurementMode) {
                         measurementPoints.clear()
-                        Toast.makeText(context, "მანძილის საზომი ჩაირთო: შეეხეთ რუკას წერტილების გასაზომად", Toast.LENGTH_SHORT).show()
+                    } else {
+                        Toast.makeText(context, "შეეხეთ რუკას მანძილის გასაზომად", Toast.LENGTH_SHORT).show()
                     }
                 },
-                containerColor = if (isMeasurementMode) AccentGold else ForestDark.copy(alpha = 0.92f),
+                containerColor = if (isMeasurementMode) AccentGold else ForestDark.copy(alpha = 0.95f),
                 contentColor = if (isMeasurementMode) ForestBlack else AccentGold,
-                modifier = Modifier.size(42.dp).testTag("map_measure_tool")
+                shape = RoundedCornerShape(10.dp),
+                modifier = Modifier.size(42.dp)
             ) {
                 Icon(Icons.Default.Straighten, contentDescription = "მანძილის გაზომვა", modifier = Modifier.size(20.dp))
             }
 
-            // Add Spot Pin
+            // Weather & Wind Forecast Floating Action Button
+            SmallFloatingActionButton(
+                onClick = {
+                    if (tappedMapCoordinate != null) {
+                        viewModel.fetchWeatherForCoordinates(
+                            tappedMapCoordinate!!.first,
+                            tappedMapCoordinate!!.second,
+                            sourceLabel = "მონიშნული წერტილი"
+                        )
+                    } else {
+                        viewModel.fetchWeatherForCoordinates(hunterLat, hunterLng, sourceLabel = "GPS ლოკაცია")
+                    }
+                    showWeatherSheet = true
+                },
+                containerColor = ForestDark.copy(alpha = 0.95f),
+                contentColor = InfoBlue,
+                shape = RoundedCornerShape(10.dp),
+                modifier = Modifier.size(42.dp)
+            ) {
+                Icon(Icons.Default.Air, contentDescription = "ამინდი და ქარი", modifier = Modifier.size(20.dp))
+            }
+
+            // Add Custom Spot FAB
             FloatingActionButton(
                 onClick = {
-                    tappedMapCoordinate = null
                     showAddSpotDialog = true
                 },
                 containerColor = AccentGold,
                 contentColor = ForestBlack,
-                modifier = Modifier.size(50.dp).testTag("map_add_spot")
+                shape = RoundedCornerShape(14.dp),
+                modifier = Modifier
+                    .size(48.dp)
+                    .testTag("fab_add_spot")
             ) {
-                Icon(Icons.Default.AddLocationAlt, contentDescription = "წერტილის დამატება", modifier = Modifier.size(26.dp))
+                Icon(Icons.Default.AddLocationAlt, contentDescription = "წერტილის დამატება", modifier = Modifier.size(24.dp))
             }
         }
 
-        // Tapped Coordinate Quick Marker Creation Bar
-        if (tappedMapCoordinate != null && !isMeasurementMode && selectedSpot == null) {
+        // Tapped Coordinate Placement Prompt Banner
+        if (tappedMapCoordinate != null && !isMeasurementMode) {
+            val tapCoord = tappedMapCoordinate!!
+            val tapDistKm = calculateDistance(hunterLat, hunterLng, tapCoord.first, tapCoord.second)
+
             Surface(
+                shape = RoundedCornerShape(12.dp),
+                color = ForestDark.copy(alpha = 0.96f),
+                border = androidx.compose.foundation.BorderStroke(1.dp, AccentGold),
                 modifier = Modifier
                     .align(Alignment.BottomCenter)
+                    .padding(horizontal = 16.dp, vertical = 84.dp)
                     .fillMaxWidth()
-                    .navigationBarsPadding()
-                    .padding(start = 14.dp, end = 14.dp, bottom = 80.dp),
-                shape = RoundedCornerShape(14.dp),
-                color = ForestDark,
-                border = androidx.compose.foundation.BorderStroke(1.dp, AccentGold)
             ) {
                 Row(
                     modifier = Modifier.padding(12.dp),
@@ -588,13 +760,14 @@ fun MapScreen(
                 ) {
                     Row(
                         verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        modifier = Modifier.weight(1f)
                     ) {
-                        Icon(Icons.Default.PinDrop, contentDescription = null, tint = AccentGold)
+                        Icon(Icons.Default.Place, contentDescription = null, tint = AccentGold, modifier = Modifier.size(24.dp))
                         Column {
-                            Text("მონიშნული წერტილი რუკაზე", color = TextPrimary, fontWeight = FontWeight.Bold, fontSize = 12.5.sp)
+                            Text("მონიშნული კოორდინატი", color = TextPrimary, fontWeight = FontWeight.Bold, fontSize = 13.sp)
                             Text(
-                                String.format(java.util.Locale.US, "%.4f°N, %.4f°E", tappedMapCoordinate!!.first, tappedMapCoordinate!!.second),
+                                text = String.format(java.util.Locale.US, "%.4f°N, %.4f°E (%.1f კმ GPS-იდან)", tapCoord.first, tapCoord.second, tapDistKm),
                                 color = TextSecondary,
                                 fontSize = 11.sp
                             )
@@ -602,6 +775,26 @@ fun MapScreen(
                     }
 
                     Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        // Weather at Tapped Coordinate
+                        OutlinedButton(
+                            onClick = {
+                                viewModel.fetchWeatherForCoordinates(
+                                    tapCoord.first,
+                                    tapCoord.second,
+                                    sourceLabel = "მონიშნული კოორდინატი"
+                                )
+                                showWeatherSheet = true
+                            },
+                            colors = ButtonDefaults.outlinedButtonColors(contentColor = InfoBlue),
+                            border = androidx.compose.foundation.BorderStroke(1.dp, InfoBlue),
+                            shape = RoundedCornerShape(8.dp),
+                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp)
+                        ) {
+                            Icon(Icons.Default.Air, contentDescription = null, modifier = Modifier.size(14.dp))
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text("ამინდი", fontSize = 11.5.sp, fontWeight = FontWeight.Bold)
+                        }
+
                         Button(
                             onClick = {
                                 showAddSpotDialog = true
@@ -650,6 +843,14 @@ fun MapScreen(
                     },
                     onExternalNavigate = {
                         openExternalMapNavigation(context, selectedSpot!!.latitude, selectedSpot!!.longitude, selectedSpot!!.name)
+                    },
+                    onCheckWeather = {
+                        viewModel.fetchWeatherForCoordinates(
+                            selectedSpot!!.latitude,
+                            selectedSpot!!.longitude,
+                            sourceLabel = selectedSpot!!.name
+                        )
+                        showWeatherSheet = true
                     },
                     onClose = { selectedSpot = null }
                 )
@@ -771,6 +972,123 @@ fun MapScreen(
         )
     }
 
+    // Map Layer Selection Bottom Sheet
+    if (showLayerSelectionSheet) {
+        ModalBottomSheet(
+            onDismissRequest = { showLayerSelectionSheet = false },
+            containerColor = ForestDark,
+            dragHandle = { BottomSheetDefaults.DragHandle(color = AccentGold) }
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp, vertical = 8.dp)
+            ) {
+                Text(
+                    text = "რუკის ფენის არჩევა",
+                    color = TextPrimary,
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 16.sp
+                )
+                Text(
+                    text = "სატელიტური, ტოპოგრაფიული და ქუჩების ფენები ჩაიტვირთება ავტომატურად GPS კოორდინატებზე",
+                    color = TextSecondary,
+                    fontSize = 11.5.sp
+                )
+
+                Spacer(modifier = Modifier.height(14.dp))
+
+                MapLayerType.values().forEach { layer ->
+                    val isSelected = selectedMapLayer == layer
+                    Card(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(vertical = 4.dp)
+                            .clickable {
+                                selectedMapLayer = layer
+                                showLayerSelectionSheet = false
+                            },
+                        colors = CardDefaults.cardColors(
+                            containerColor = if (isSelected) HuntingGreenDark else ForestSurfaceVariant
+                        ),
+                        border = androidx.compose.foundation.BorderStroke(
+                            1.dp,
+                            if (isSelected) AccentGold else ForestCardBorder
+                        )
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(12.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(12.dp)
+                            ) {
+                                Box(
+                                    modifier = Modifier
+                                        .size(38.dp)
+                                        .clip(CircleShape)
+                                        .background(if (isSelected) AccentGold else ForestSurface),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Icon(
+                                        imageVector = layer.icon,
+                                        contentDescription = null,
+                                        tint = if (isSelected) ForestBlack else TextPrimary,
+                                        modifier = Modifier.size(20.dp)
+                                    )
+                                }
+
+                                Column {
+                                    Text(
+                                        text = layer.title,
+                                        color = TextPrimary,
+                                        fontWeight = FontWeight.Bold,
+                                        fontSize = 13.5.sp
+                                    )
+                                    Text(
+                                        text = layer.subtitle,
+                                        color = TextSecondary,
+                                        fontSize = 11.sp
+                                    )
+                                }
+                            }
+
+                            if (isSelected) {
+                                Icon(Icons.Default.CheckCircle, contentDescription = null, tint = AccentGold, modifier = Modifier.size(20.dp))
+                            }
+                        }
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(20.dp))
+            }
+        }
+    }
+
+    // Comprehensive Hunting Weather & Wind Bottom Sheet
+    if (showWeatherSheet) {
+        HuntingWeatherBottomSheet(
+            weather = detailedWeather,
+            isLoading = isWeatherLoading,
+            currentHunterLat = hunterLat,
+            currentHunterLng = hunterLng,
+            tappedLat = tappedMapCoordinate?.first,
+            tappedLng = tappedMapCoordinate?.second,
+            onRefreshGpsWeather = {
+                viewModel.fetchWeatherForCoordinates(hunterLat, hunterLng, sourceLabel = "GPS ლოკაცია")
+            },
+            onRefreshTappedWeather = { lat, lng ->
+                viewModel.fetchWeatherForCoordinates(lat, lng, sourceLabel = "მონიშნული წერტილი")
+            },
+            onSelectRegion = { lat, lng, name ->
+                viewModel.fetchWeatherForCoordinates(lat, lng, sourceLabel = name)
+            },
+            onDismiss = { showWeatherSheet = false }
+        )
+    }
+
     // Privacy Info Dialog
     if (showPrivacyInfoDialog) {
         AlertDialog(
@@ -811,8 +1129,13 @@ fun MapScreen(
     }
 }
 
+/**
+ * High-performance Web Mercator Slippy Map Tile Renderer with custom Coil ImageLoader
+ */
 @Composable
-private fun TacticalInteractiveMapCanvas(
+private fun TileMercatorMap(
+    layerType: MapLayerType,
+    tileImageLoader: ImageLoader,
     spots: List<HuntingSpotEntity>,
     selectedSpot: HuntingSpotEntity?,
     navigatingSpot: HuntingSpotEntity?,
@@ -822,11 +1145,15 @@ private fun TacticalInteractiveMapCanvas(
     mapOffset: Offset,
     isMeasurementMode: Boolean,
     measurementPoints: List<Pair<Double, Double>>,
-    onTransform: (pan: Offset, zoom: Float) -> Unit,
+    onTransform: (pan: Offset, zoomFactor: Float) -> Unit,
     onSpotClicked: (HuntingSpotEntity) -> Unit,
     onMapTapped: (lat: Double, lng: Double) -> Unit,
     modifier: Modifier = Modifier
 ) {
+    val context = LocalContext.current
+    val intZoom = mapZoom.toInt().coerceIn(8, 18)
+    val subZoomScale = (2.0.pow((mapZoom - intZoom).toDouble())).toFloat()
+
     // Pulse animation for hunter radar & danger zones
     val infiniteTransition = rememberInfiniteTransition(label = "RadarPulse")
     val pulseRadius by infiniteTransition.animateFloat(
@@ -839,7 +1166,7 @@ private fun TacticalInteractiveMapCanvas(
         label = "pulse"
     )
 
-    Box(
+    BoxWithConstraints(
         modifier = modifier
             .pointerInput(Unit) {
                 detectTransformGestures { _, pan, zoom, _ ->
@@ -847,111 +1174,123 @@ private fun TacticalInteractiveMapCanvas(
                 }
             }
             .pointerInput(Unit) {
-                detectTapGestures { offset ->
-                    // Approximate lat/lng from tap offset
-                    val centerScreenX = size.width / 2f + mapOffset.x
-                    val centerScreenY = size.height / 2f + mapOffset.y
+                detectTapGestures { tapOffset ->
+                    val screenWidth = size.width.toFloat()
+                    val screenHeight = size.height.toFloat()
 
-                    val dLng = (offset.x - centerScreenX) / (8000f * mapZoom)
-                    val dLat = -(offset.y - centerScreenY) / (8000f * mapZoom)
+                    val centerTileX = lon2tileX(hunterLng, intZoom)
+                    val centerTileY = lat2tileY(hunterLat, intZoom)
 
-                    val tappedLat = hunterLat + dLat
-                    val tappedLng = hunterLng + dLng
+                    val pxFromCenterX = (tapOffset.x - (screenWidth / 2f + mapOffset.x)) / (256f * subZoomScale)
+                    val pxFromCenterY = (tapOffset.y - (screenHeight / 2f + mapOffset.y)) / (256f * subZoomScale)
+
+                    val targetTileX = centerTileX + pxFromCenterX
+                    val targetTileY = centerTileY + pxFromCenterY
+
+                    val tappedLng = tileX2lon(targetTileX, intZoom)
+                    val tappedLat = tileY2lat(targetTileY, intZoom)
 
                     onMapTapped(tappedLat, tappedLng)
                 }
             }
     ) {
+        val screenWidthPx = constraints.maxWidth.toFloat()
+        val screenHeightPx = constraints.maxHeight.toFloat()
+        val density = LocalDensity.current.density
+
+        // Hunter center in tile space
+        val centerTileX = lon2tileX(hunterLng, intZoom)
+        val centerTileY = lat2tileY(hunterLat, intZoom)
+
+        // Viewport center in pixels
+        val centerScreenPxX = screenWidthPx / 2f + mapOffset.x
+        val centerScreenPxY = screenHeightPx / 2f + mapOffset.y
+
+        val tileSizePx = 256f * subZoomScale * density
+
+        // Determine range of visible tiles
+        val tilesAcross = ceil(screenWidthPx / (256f * density)).toInt() + 2
+        val tilesDown = ceil(screenHeightPx / (256f * density)).toInt() + 2
+
+        val minTileX = floor(centerTileX - tilesAcross / 2.0).toInt()
+        val maxTileX = ceil(centerTileX + tilesAcross / 2.0).toInt()
+        val minTileY = floor(centerTileY - tilesDown / 2.0).toInt()
+        val maxTileY = ceil(centerTileY + tilesDown / 2.0).toInt()
+
+        val maxTileIndex = (1 shl intZoom) - 1
+
+        // Render Base Map Raster Tiles
+        Box(modifier = Modifier.fillMaxSize()) {
+            for (tx in minTileX..maxTileX) {
+                for (ty in minTileY..maxTileY) {
+                    val wrappedTx = ((tx % (1 shl intZoom)) + (1 shl intZoom)) % (1 shl intZoom)
+                    if (ty in 0..maxTileIndex) {
+                        val tileOffsetX = centerScreenPxX + (tx - centerTileX).toFloat() * (256f * density * subZoomScale)
+                        val tileOffsetY = centerScreenPxY + (ty - centerTileY).toFloat() * (256f * density * subZoomScale)
+
+                        val tileUrl = getTileUrl(layerType, intZoom, wrappedTx, ty)
+
+                        AsyncImage(
+                            model = ImageRequest.Builder(context)
+                                .data(tileUrl)
+                                .crossfade(true)
+                                .build(),
+                            imageLoader = tileImageLoader,
+                            contentDescription = null,
+                            contentScale = ContentScale.FillBounds,
+                            modifier = Modifier
+                                .offset {
+                                    IntOffset(tileOffsetX.roundToInt(), tileOffsetY.roundToInt())
+                                }
+                                .size((256f * subZoomScale).dp)
+                        )
+                    }
+                }
+            }
+
+            // Subtle dark tactical tint for high-contrast visibility when on satellite or light maps
+            if (layerType == MapLayerType.SATELLITE) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .background(Color.Black.copy(alpha = 0.15f))
+                )
+            } else if (layerType == MapLayerType.OPENSTREETMAP) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .background(Color.Black.copy(alpha = 0.08f))
+                )
+            }
+        }
+
+        // Vector Canvas Overlay (Bearing Lines, Polylines, Radar, Elevation & Danger Zones)
         Canvas(modifier = Modifier.fillMaxSize()) {
-            val width = size.width
-            val height = size.height
-            val centerX = width / 2f + mapOffset.x
-            val centerY = height / 2f + mapOffset.y
-
-            // Draw Background Topo Grid
-            drawRect(color = ForestDark)
-
-            val gridSpacing = 60f * mapZoom
-            var x = (mapOffset.x % gridSpacing)
-            while (x < width) {
-                drawLine(
-                    color = ForestCardBorder.copy(alpha = 0.35f),
-                    start = Offset(x, 0f),
-                    end = Offset(x, height),
-                    strokeWidth = 1f
-                )
-                x += gridSpacing
-            }
-
-            var y = (mapOffset.y % gridSpacing)
-            while (y < height) {
-                drawLine(
-                    color = ForestCardBorder.copy(alpha = 0.35f),
-                    start = Offset(0f, y),
-                    end = Offset(width, y),
-                    strokeWidth = 1f
-                )
-                y += gridSpacing
-            }
-
-            // Draw Topographic Elevation Contours (Georgian Mountain Ridges)
-            val contourCount = 7
-            for (i in 1..contourCount) {
-                drawCircle(
-                    color = HuntingGreenDark.copy(alpha = 0.35f),
-                    radius = (75f * i * mapZoom),
-                    center = Offset(centerX - 90f * mapZoom, centerY - 70f * mapZoom),
-                    style = Stroke(width = 1.4f)
-                )
-
-                drawCircle(
-                    color = EarthKhaki.copy(alpha = 0.25f),
-                    radius = (55f * i * mapZoom),
-                    center = Offset(centerX + 130f * mapZoom, centerY + 90f * mapZoom),
-                    style = Stroke(width = 1.2f)
-                )
-            }
-
-            // Draw River/Stream Path (e.g. Alazani / Iori tributary)
-            val riverPath = Path().apply {
-                moveTo(0f, centerY + 180f * mapZoom)
-                quadraticTo(
-                    centerX - 60f * mapZoom,
-                    centerY + 70f * mapZoom,
-                    centerX + 70f * mapZoom,
-                    centerY - 90f * mapZoom
-                )
-                lineTo(width, centerY - 210f * mapZoom)
-            }
-            drawPath(
-                path = riverPath,
-                color = MapWater.copy(alpha = 0.75f),
-                style = Stroke(width = 4.5f * mapZoom)
-            )
-
-            // Draw Danger Zone Radiation Halos for any danger spots
+            // Draw Danger Zones
             spots.filter { it.category == "საფრთხე" }.forEach { dangerSpot ->
-                val dLat = (dangerSpot.latitude - hunterLat) * 8000f * mapZoom
-                val dLng = (dangerSpot.longitude - hunterLng) * 8000f * mapZoom
-                val dangerCenter = Offset(centerX + dLng.toFloat(), centerY - dLat.toFloat())
+                val dangerTileX = lon2tileX(dangerSpot.longitude, intZoom)
+                val dangerTileY = lat2tileY(dangerSpot.latitude, intZoom)
 
-                // Hazard warning perimeter
+                val dangerScreenX = centerScreenPxX + (dangerTileX - centerTileX).toFloat() * (256f * density * subZoomScale)
+                val dangerScreenY = centerScreenPxY + (dangerTileY - centerTileY).toFloat() * (256f * density * subZoomScale)
+                val dangerCenter = Offset(dangerScreenX, dangerScreenY)
+
                 drawCircle(
-                    color = AlertRed.copy(alpha = 0.15f),
-                    radius = 45f * mapZoom,
+                    color = AlertRed.copy(alpha = 0.18f),
+                    radius = 35f * density * subZoomScale,
                     center = dangerCenter
                 )
                 drawCircle(
-                    color = AlertRed.copy(alpha = 0.4f * (1f - pulseRadius)),
-                    radius = (45f + 25f * pulseRadius) * mapZoom,
+                    color = AlertRed.copy(alpha = 0.45f * (1f - pulseRadius)),
+                    radius = (35f + 25f * pulseRadius) * density * subZoomScale,
                     center = dangerCenter,
-                    style = Stroke(width = 1.5f)
+                    style = Stroke(width = 2f)
                 )
                 drawCircle(
                     color = AlertRed,
-                    radius = 45f * mapZoom,
+                    radius = 35f * density * subZoomScale,
                     center = dangerCenter,
-                    style = Stroke(width = 1.2f, pathEffect = PathEffect.dashPathEffect(floatArrayOf(8f, 6f), 0f))
+                    style = Stroke(width = 1.5f, pathEffect = PathEffect.dashPathEffect(floatArrayOf(10f, 6f), 0f))
                 )
             }
 
@@ -959,9 +1298,11 @@ private fun TacticalInteractiveMapCanvas(
             if (isMeasurementMode && measurementPoints.isNotEmpty()) {
                 val polyPath = Path()
                 measurementPoints.forEachIndexed { index, pt ->
-                    val ptDLat = (pt.first - hunterLat) * 8000f * mapZoom
-                    val ptDLng = (pt.second - hunterLng) * 8000f * mapZoom
-                    val ptOffset = Offset(centerX + ptDLng.toFloat(), centerY - ptDLat.toFloat())
+                    val ptTileX = lon2tileX(pt.second, intZoom)
+                    val ptTileY = lat2tileY(pt.first, intZoom)
+                    val ptScreenX = centerScreenPxX + (ptTileX - centerTileX).toFloat() * (256f * density * subZoomScale)
+                    val ptScreenY = centerScreenPxY + (ptTileY - centerTileY).toFloat() * (256f * density * subZoomScale)
+                    val ptOffset = Offset(ptScreenX, ptScreenY)
 
                     if (index == 0) {
                         polyPath.moveTo(ptOffset.x, ptOffset.y)
@@ -969,97 +1310,104 @@ private fun TacticalInteractiveMapCanvas(
                         polyPath.lineTo(ptOffset.x, ptOffset.y)
                     }
 
-                    // Waypoint Circle
                     drawCircle(
                         color = AccentGold,
-                        radius = 6f * mapZoom,
+                        radius = 6f * density,
                         center = ptOffset
                     )
                     drawCircle(
                         color = ForestBlack,
-                        radius = 3f * mapZoom,
+                        radius = 3f * density,
                         center = ptOffset
                     )
                 }
 
                 if (measurementPoints.size == 1) {
-                    // Connect hunter position to single waypoint
                     val pt0 = measurementPoints[0]
-                    val pt0DLat = (pt0.first - hunterLat) * 8000f * mapZoom
-                    val pt0DLng = (pt0.second - hunterLng) * 8000f * mapZoom
-                    val pt0Offset = Offset(centerX + pt0DLng.toFloat(), centerY - pt0DLat.toFloat())
+                    val pt0TileX = lon2tileX(pt0.second, intZoom)
+                    val pt0TileY = lat2tileY(pt0.first, intZoom)
+                    val pt0Offset = Offset(
+                        centerScreenPxX + (pt0TileX - centerTileX).toFloat() * (256f * density * subZoomScale),
+                        centerScreenPxY + (pt0TileY - centerTileY).toFloat() * (256f * density * subZoomScale)
+                    )
 
                     drawLine(
                         color = AccentGold,
-                        start = Offset(centerX, centerY),
+                        start = Offset(centerScreenPxX, centerScreenPxY),
                         end = pt0Offset,
-                        strokeWidth = 2.5f * mapZoom,
-                        pathEffect = PathEffect.dashPathEffect(floatArrayOf(10f, 6f), 0f)
+                        strokeWidth = 3f * density,
+                        pathEffect = PathEffect.dashPathEffect(floatArrayOf(12f, 6f), 0f)
                     )
                 } else if (measurementPoints.size >= 2) {
                     drawPath(
                         path = polyPath,
                         color = AccentGold,
-                        style = Stroke(width = 3f * mapZoom, pathEffect = PathEffect.dashPathEffect(floatArrayOf(12f, 6f), 0f))
+                        style = Stroke(width = 3.5f * density, pathEffect = PathEffect.dashPathEffect(floatArrayOf(14f, 6f), 0f))
                     )
                 }
             }
 
-            // Draw Navigation Vector Line (from Hunter to Navigating Spot)
+            // Draw Navigation Vector Line (from Hunter GPS to Target Spot)
             if (navigatingSpot != null) {
-                val targetDLat = (navigatingSpot.latitude - hunterLat) * 8000f * mapZoom
-                val targetDLng = (navigatingSpot.longitude - hunterLng) * 8000f * mapZoom
-                val targetOffset = Offset(centerX + targetDLng.toFloat(), centerY - targetDLat.toFloat())
+                val targetTileX = lon2tileX(navigatingSpot.longitude, intZoom)
+                val targetTileY = lat2tileY(navigatingSpot.latitude, intZoom)
+                val targetOffset = Offset(
+                    centerScreenPxX + (targetTileX - centerTileX).toFloat() * (256f * density * subZoomScale),
+                    centerScreenPxY + (targetTileY - centerTileY).toFloat() * (256f * density * subZoomScale)
+                )
 
                 drawLine(
                     color = HuntingGreenLight,
-                    start = Offset(centerX, centerY),
+                    start = Offset(centerScreenPxX, centerScreenPxY),
                     end = targetOffset,
-                    strokeWidth = 3f * mapZoom,
-                    pathEffect = PathEffect.dashPathEffect(floatArrayOf(14f, 8f), 0f)
+                    strokeWidth = 3.5f * density,
+                    pathEffect = PathEffect.dashPathEffect(floatArrayOf(16f, 8f), 0f)
                 )
             }
 
             // Draw Hunter Location Marker (Pulsing Radar Circle)
+            val hunterCenter = Offset(centerScreenPxX, centerScreenPxY)
             drawCircle(
                 color = HuntingGreenPrimary.copy(alpha = 0.25f * (1f - pulseRadius)),
-                radius = (30f + 25f * pulseRadius) * mapZoom,
-                center = Offset(centerX, centerY)
+                radius = (24f + 20f * pulseRadius) * density,
+                center = hunterCenter
             )
             drawCircle(
-                color = HuntingGreenPrimary.copy(alpha = 0.35f),
-                radius = 20f * mapZoom,
-                center = Offset(centerX, centerY)
+                color = HuntingGreenPrimary.copy(alpha = 0.4f),
+                radius = 16f * density,
+                center = hunterCenter
             )
             drawCircle(
                 color = AccentGold,
-                radius = 7f * mapZoom,
-                center = Offset(centerX, centerY)
+                radius = 7f * density,
+                center = hunterCenter
             )
             drawCircle(
                 color = ForestBlack,
-                radius = 3.5f * mapZoom,
-                center = Offset(centerX, centerY)
+                radius = 3.5f * density,
+                center = hunterCenter
             )
         }
 
         // Overlay Interactive Spot Pin Markers
         spots.forEach { spot ->
-            val dLat = (spot.latitude - hunterLat) * 8000f * mapZoom
-            val dLng = (spot.longitude - hunterLng) * 8000f * mapZoom
+            val spotTileX = lon2tileX(spot.longitude, intZoom)
+            val spotTileY = lat2tileY(spot.latitude, intZoom)
 
-            val pinX = (mapOffset.x + dLng).toFloat()
-            val pinY = (mapOffset.y - dLat).toFloat()
+            val spotScreenX = centerScreenPxX + (spotTileX - centerTileX).toFloat() * (256f * density * subZoomScale)
+            val spotScreenY = centerScreenPxY + (spotTileY - centerTileY).toFloat() * (256f * density * subZoomScale)
 
             val isSelected = selectedSpot?.id == spot.id
             val isNavigating = navigatingSpot?.id == spot.id
 
             Box(
                 modifier = Modifier
-                    .offset(
-                        x = (180.dp + (pinX / 3).dp).coerceIn((-100).dp, 500.dp),
-                        y = (340.dp + (pinY / 3).dp).coerceIn((-100).dp, 750.dp)
-                    )
+                    .offset {
+                        IntOffset(
+                            (spotScreenX - 45f * density).roundToInt(),
+                            (spotScreenY - 35f * density).roundToInt()
+                        )
+                    }
                     .clip(RoundedCornerShape(8.dp))
                     .clickable { onSpotClicked(spot) }
                     .background(
@@ -1069,7 +1417,7 @@ private fun TacticalInteractiveMapCanvas(
                     )
                     .border(
                         1.2.dp,
-                        if (isSelected || isNavigating) Color.White else ForestBlack.copy(alpha = 0.6f),
+                        if (isSelected || isNavigating) Color.White else ForestBlack.copy(alpha = 0.7f),
                         RoundedCornerShape(8.dp)
                     )
                     .padding(horizontal = 7.dp, vertical = 4.dp),
@@ -1082,13 +1430,13 @@ private fun TacticalInteractiveMapCanvas(
                     Icon(
                         imageVector = getCategoryIcon(spot.category),
                         contentDescription = null,
-                        tint = if (isSelected || isNavigating) ForestBlack else TextPrimary,
+                        tint = if (isSelected || isNavigating) ForestBlack else Color.White,
                         modifier = Modifier.size(13.dp)
                     )
                     Text(
                         text = spot.name,
-                        color = if (isSelected || isNavigating) ForestBlack else TextPrimary,
-                        fontSize = 10.5.sp,
+                        color = if (isSelected || isNavigating) ForestBlack else Color.White,
+                        fontSize = 11.sp,
                         fontWeight = FontWeight.Bold,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis
@@ -1107,6 +1455,41 @@ private fun TacticalInteractiveMapCanvas(
     }
 }
 
+/**
+ * Slippy map URL provider with fallbacks
+ */
+private fun getTileUrl(layer: MapLayerType, z: Int, x: Int, y: Int): String {
+    return when (layer) {
+        MapLayerType.SATELLITE ->
+            "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/$z/$y/$x"
+        MapLayerType.OPENSTREETMAP ->
+            "https://tile.openstreetmap.org/$z/$x/$y.png"
+        MapLayerType.OPENTOPOMAP ->
+            "https://tile.opentopomap.org/$z/$x/$y.png"
+        MapLayerType.TACTICAL_DARK ->
+            "https://basemaps.cartocdn.com/rastertiles/dark_all/$z/$x/$y.png"
+    }
+}
+
+// Web Mercator Slippy Map conversions
+private fun lon2tileX(lon: Double, zoom: Int): Double {
+    return (lon + 180.0) / 360.0 * (1 shl zoom)
+}
+
+private fun lat2tileY(lat: Double, zoom: Int): Double {
+    val latRad = Math.toRadians(lat.coerceIn(-85.05112878, 85.05112878))
+    return (1.0 - ln(tan(latRad) + 1.0 / cos(latRad)) / Math.PI) / 2.0 * (1 shl zoom)
+}
+
+private fun tileX2lon(x: Double, zoom: Int): Double {
+    return x / (1 shl zoom) * 360.0 - 180.0
+}
+
+private fun tileY2lat(y: Double, zoom: Int): Double {
+    val n = Math.PI - 2.0 * Math.PI * y / (1 shl zoom)
+    return Math.toDegrees(atan(sinh(n)))
+}
+
 @Composable
 private fun SpotDetailFloatingCard(
     spot: HuntingSpotEntity,
@@ -1118,6 +1501,7 @@ private fun SpotDetailFloatingCard(
     onDelete: () -> Unit,
     onNavigate: () -> Unit,
     onExternalNavigate: () -> Unit,
+    onCheckWeather: () -> Unit,
     onClose: () -> Unit
 ) {
     val distanceKm = remember(spot, hunterLat, hunterLng) {
@@ -1291,10 +1675,10 @@ private fun SpotDetailFloatingCard(
 
             Spacer(modifier = Modifier.height(10.dp))
 
-            // Action Buttons (In-App Direct Compass Navigation & External Maps App)
+            // Action Buttons (In-App Direct Compass Navigation, Weather & External Maps App)
             Row(
                 modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
             ) {
                 Button(
                     onClick = onNavigate,
@@ -1303,12 +1687,27 @@ private fun SpotDetailFloatingCard(
                         contentColor = ForestBlack
                     ),
                     shape = RoundedCornerShape(8.dp),
-                    modifier = Modifier.weight(1.2f),
+                    modifier = Modifier.weight(1.1f),
                     contentPadding = PaddingValues(vertical = 8.dp)
                 ) {
-                    Icon(Icons.Default.Navigation, contentDescription = null, modifier = Modifier.size(16.dp))
-                    Spacer(modifier = Modifier.width(6.dp))
-                    Text("პირდაპირი გეზი", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                    Icon(Icons.Default.Navigation, contentDescription = null, modifier = Modifier.size(15.dp))
+                    Spacer(modifier = Modifier.width(4.dp))
+                    Text("გეზი", fontSize = 11.5.sp, fontWeight = FontWeight.Bold)
+                }
+
+                OutlinedButton(
+                    onClick = onCheckWeather,
+                    colors = ButtonDefaults.outlinedButtonColors(
+                        contentColor = InfoBlue
+                    ),
+                    border = androidx.compose.foundation.BorderStroke(1.dp, InfoBlue),
+                    shape = RoundedCornerShape(8.dp),
+                    modifier = Modifier.weight(0.95f),
+                    contentPadding = PaddingValues(vertical = 8.dp)
+                ) {
+                    Icon(Icons.Default.Air, contentDescription = null, modifier = Modifier.size(15.dp))
+                    Spacer(modifier = Modifier.width(4.dp))
+                    Text("ამინდი", fontSize = 11.5.sp, fontWeight = FontWeight.Bold)
                 }
 
                 OutlinedButton(
@@ -1318,12 +1717,12 @@ private fun SpotDetailFloatingCard(
                     ),
                     border = androidx.compose.foundation.BorderStroke(1.dp, AccentGold),
                     shape = RoundedCornerShape(8.dp),
-                    modifier = Modifier.weight(0.9f),
+                    modifier = Modifier.weight(0.95f),
                     contentPadding = PaddingValues(vertical = 8.dp)
                 ) {
-                    Icon(Icons.Default.Map, contentDescription = null, modifier = Modifier.size(15.dp))
+                    Icon(Icons.Default.Map, contentDescription = null, modifier = Modifier.size(14.dp))
                     Spacer(modifier = Modifier.width(4.dp))
-                    Text("რუკაზე", fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                    Text("რუკაზე", fontSize = 11.5.sp, fontWeight = FontWeight.SemiBold)
                 }
             }
         }

@@ -142,8 +142,60 @@ data class WeatherInfo(
     val rainProbabilityPercent: Int = 15,
     val sunriseTime: String = "06:22",
     val sunsetTime: String = "19:48",
-    val uvIndex: Int = 4
+    val uvIndex: Int = 4,
+    val windGustsKmh: Int = 16,
+    val windDegree: Int = 45,
+    val latitude: Double = 41.7335,
+    val longitude: Double = 45.3312
 )
+
+data class DetailedHuntingWeather(
+    val locationName: String = "საგარეჯოს ველები",
+    val latitude: Double = 41.7335,
+    val longitude: Double = 45.3312,
+    val temperatureC: Double = 18.0,
+    val feelsLikeC: Double = 17.0,
+    val tempMaxC: Double = 22.0,
+    val tempMinC: Double = 12.0,
+    val conditionDescription: String = "ნაწილობრივ ღრუბლიანი",
+    val weatherCode: Int = 1,
+    val windSpeedKmh: Double = 11.0,
+    val windDirectionDegrees: Int = 45,
+    val windDirectionNameKa: String = "ჩრდილო-აღმოსავლეთი (NE)",
+    val windGustsKmh: Double = 18.0,
+    val surfacePressureHpa: Double = 1018.0,
+    val humidityPercent: Int = 58,
+    val precipitationProbabilityPercent: Int = 10,
+    val precipitationMm: Double = 0.0,
+    val sunriseTime: String = "06:24",
+    val sunsetTime: String = "19:46",
+    val isDay: Boolean = true,
+    val huntingConditionScore: HuntingConditionScore = HuntingConditionScore.VERY_GOOD,
+    val huntingAdvice: String = "ქარის სიჩქარე და წნევა იდეალურია ნადირის აქტივობისა და კვალის დასაჭერად.",
+    val lastUpdatedTimestamp: Long = System.currentTimeMillis(),
+    val isLoading: Boolean = false,
+    val error: String? = null
+) {
+    fun toWeatherInfo(): WeatherInfo {
+        return WeatherInfo(
+            locationName = locationName,
+            temperatureC = temperatureC.toInt(),
+            feelsLikeC = feelsLikeC.toInt(),
+            condition = conditionDescription,
+            windKmh = windSpeedKmh.toInt(),
+            windDirection = windDirectionNameKa,
+            humidityPercent = humidityPercent,
+            pressureHpa = surfacePressureHpa.toInt(),
+            rainProbabilityPercent = precipitationProbabilityPercent,
+            sunriseTime = sunriseTime,
+            sunsetTime = sunsetTime,
+            windGustsKmh = windGustsKmh.toInt(),
+            windDegree = windDirectionDegrees,
+            latitude = latitude,
+            longitude = longitude
+        )
+    }
+}
 
 enum class HuntingConditionScore(
     val labelKa: String,

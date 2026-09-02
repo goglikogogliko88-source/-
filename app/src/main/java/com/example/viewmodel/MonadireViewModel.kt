@@ -6,6 +6,7 @@ import androidx.lifecycle.viewModelScope
 import com.example.data.local.InitialData
 import com.example.data.local.MonadireDatabase
 import com.example.data.model.*
+import com.example.data.remote.OpenMeteoWeatherService
 import com.example.data.repository.MonadireRepository
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -61,19 +62,32 @@ class MonadireViewModel(application: Application) : AndroidViewModel(application
     private val _currentDestination = MutableStateFlow(AppDestination.HOME)
     val currentDestination: StateFlow<AppDestination> = _currentDestination.asStateFlow()
 
+    private val _detailedWeather = MutableStateFlow(DetailedHuntingWeather())
+    val detailedWeather: StateFlow<DetailedHuntingWeather> = _detailedWeather.asStateFlow()
+
+    private val _isWeatherLoading = MutableStateFlow(false)
+    val isWeatherLoading: StateFlow<Boolean> = _isWeatherLoading.asStateFlow()
+
+    private val _weatherSourceLabel = MutableStateFlow("GPS ლოკაცია")
+    val weatherSourceLabel: StateFlow<String> = _weatherSourceLabel.asStateFlow()
+
     private val _currentWeather = MutableStateFlow(
         WeatherInfo(
-            locationName = "ბორჯომი / თბილისის შემოგარენი",
+            locationName = "საგარეჯო / იორის ხეობა",
             temperatureC = 18,
             feelsLikeC = 17,
             condition = "ნაწილობრივ ღრუბლიანი, მშრალი",
-            windKmh = 10,
-            windDirection = "ჩრდილო-დასავლეთი (სუსტი)",
+            windKmh = 11,
+            windDirection = "ჩრდილო-აღმოსავლეთი (NE)",
             humidityPercent = 58,
-            pressureHpa = 1016,
+            pressureHpa = 1018,
             rainProbabilityPercent = 10,
             sunriseTime = "06:24",
-            sunsetTime = "19:46"
+            sunsetTime = "19:46",
+            windGustsKmh = 18,
+            windDegree = 45,
+            latitude = 41.7335,
+            longitude = 45.3312
         )
     )
     val currentWeather: StateFlow<WeatherInfo> = _currentWeather.asStateFlow()
@@ -211,6 +225,29 @@ class MonadireViewModel(application: Application) : AndroidViewModel(application
         _selectedSpotCategory.value = category
     }
 
+    fun fetchWeatherForCoordinates(
+        lat: Double,
+        lng: Double,
+        customName: String? = null,
+        sourceLabel: String = "GPS ლოკაცია"
+    ) {
+        viewModelScope.launch {
+            _isWeatherLoading.value = true
+            _weatherSourceLabel.value = sourceLabel
+            try {
+                val detailed = OpenMeteoWeatherService.fetchHuntingWeather(lat, lng, customName)
+                _detailedWeather.value = detailed
+                _currentWeather.value = detailed.toWeatherInfo()
+                _huntingCondition.value = detailed.huntingConditionScore
+            } catch (e: Exception) {
+                // Fallback score calculation
+                updateHuntingConditionScore()
+            } finally {
+                _isWeatherLoading.value = false
+            }
+        }
+    }
+
     fun setRegionWeather(regionName: String, temp: Int, condition: String, wind: Int, windDir: String, rainProb: Int) {
         val updated = _currentWeather.value.copy(
             locationName = regionName,
@@ -221,6 +258,7 @@ class MonadireViewModel(application: Application) : AndroidViewModel(application
             rainProbabilityPercent = rainProb
         )
         _currentWeather.value = updated
+        _weatherSourceLabel.value = regionName
         updateHuntingConditionScore()
     }
 
